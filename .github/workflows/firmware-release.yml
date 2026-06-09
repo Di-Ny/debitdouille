@@ -68,7 +68,10 @@ jobs:
           cp Arduino/Debitdouille_V2/.pio/build/seeed_xiao_esp32c3/firmware.bin release/firmware_c3.bin
           cp Arduino/Debitdouille_V2/.pio/build/seeed_xiao_esp32s3/firmware.bin release/firmware_s3.bin
 
-          # Changelog = message du tag annoté (vide pour un tag léger)
+          # Changelog = message du tag annoté (vide pour un tag léger).
+          # actions/checkout remplace les tags annotés par des refs simples vers le
+          # commit : il faut re-fetcher le vrai tag pour récupérer son annotation.
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           CHANGELOG="$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")"
           export CHANGELOG
 
