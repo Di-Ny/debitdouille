@@ -23,24 +23,48 @@ class FirmwareUpdateService {
   static const _tagPrefix = 'fw-v';
   static const _cacheKey = 'fw_release_cache';
   static const _cacheTimeKey = 'fw_release_cache_time';
-  static const _cacheTtl = Duration(hours: 1);
+  // TTL court : uniquement anti-rafale (allers-retours rapides sur l'écran).
+  // Au-delà, on réinterroge toujours GitHub ; le cache ne sert alors que de
+  // secours hors-ligne — sinon une release publiée entre-temps resterait
+  // invisible pendant toute la durée du TTL.
+  static const _cacheTtl = Duration(minutes: 5);
 
   /// Dernière release firmware publiée (manifest + URLs), ou null si aucune.
-  /// Résultat mis en cache 1 h pour ménager le rate limit GitHub (60 req/h).
+  /// Interroge GitHub à chaque appel (sauf cache < 5 min) ; en cas d'échec
+  /// réseau, retombe sur la dernière release connue si disponible.
   Future<FirmwareRelease?> fetchLatestRelease({bool forceRefresh = false}) async {
     final prefs = await SharedPreferences.getInstance();
 
-    if (!forceRefresh) {
-      final cachedAt = prefs.getInt(_cacheTimeKey) ?? 0;
-      final cached = prefs.getString(_cacheKey);
-      final age = DateTime.now().millisecondsSinceEpoch - cachedAt;
-      if (cached != null && age < _cacheTtl.inMilliseconds) {
-        try {
-          return FirmwareRelease.fromJson(jsonDecode(cached));
-        } catch (_) {/* cache corrompu → on requête */}
-      }
+    FirmwareRelease? cached;
+    int cachedAt = 0;
+    final rawCache = prefs.getString(_cacheKey);
+    if (rawCache != null) {
+      try {
+        cached = FirmwareRelease.fromJson(jsonDecode(rawCache));
+        cachedAt = prefs.getInt(_cacheTimeKey) ?? 0;
+      } catch (_) {/* cache corrompu → ignoré */}
     }
 
+    if (!forceRefresh && cached != null) {
+      final age = DateTime.now().millisecondsSinceEpoch - cachedAt;
+      if (age < _cacheTtl.inMilliseconds) return cached;
+    }
+
+    try {
+      final release = await _fetchFromGitHub();
+      if (release != null) {
+        await prefs.setString(_cacheKey, jsonEncode(release.toJson()));
+        await prefs.setInt(_cacheTimeKey, DateTime.now().millisecondsSinceEpoch);
+      }
+      return release;
+    } catch (_) {
+      // Hors-ligne ou GitHub indisponible : dernière release connue, même ancienne
+      if (cached != null) return cached;
+      rethrow;
+    }
+  }
+
+  Future<FirmwareRelease?> _fetchFromGitHub() async {
     // Liste des releases (les plus récentes d'abord) plutôt que /latest :
     // le dépôt peut aussi publier des releases de l'app, on filtre par tag fw-v.
     final resp = await http.get(
@@ -72,14 +96,10 @@ class FirmwareUpdateService {
       if (mResp.statusCode != 200) {
         throw Exception('Téléchargement du manifest impossible (${mResp.statusCode}).');
       }
-      final release = FirmwareRelease.fromManifest(
+      return FirmwareRelease.fromManifest(
         jsonDecode(utf8.decode(mResp.bodyBytes)) as Map<String, dynamic>,
         assetUrls,
       );
-
-      await prefs.setString(_cacheKey, jsonEncode(release.toJson()));
-      await prefs.setInt(_cacheTimeKey, DateTime.now().millisecondsSinceEpoch);
-      return release;
     }
     return null;
   }
