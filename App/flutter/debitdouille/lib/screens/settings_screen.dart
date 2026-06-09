@@ -6,6 +6,7 @@ import '../providers/data_provider.dart';
 import '../utils/constants.dart';
 import '../utils/app_version.dart';
 import '../widgets/value_block.dart';
+import 'firmware_update_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -189,6 +190,30 @@ class SettingsScreen extends StatelessWidget {
                     : null,
                   icon: const Icon(Icons.info_outline),
                   label: const Text("Obtenir infos hardware"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.white,
+                    foregroundColor: Colors.black,
+                    disabledBackgroundColor: Colors.white24,
+                    disabledForegroundColor: Colors.white38,
+                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // Mise à jour OTA du firmware ESP32 (voir docs/ota.md)
+              Center(
+                child: ElevatedButton.icon(
+                  onPressed: dataProvider.connectedDevice != null
+                    ? () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => const FirmwareUpdateScreen(),
+                        ),
+                      )
+                    : null,
+                  icon: const Icon(Icons.system_update_alt),
+                  label: const Text("Mise à jour firmware"),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.white,
                     foregroundColor: Colors.black,

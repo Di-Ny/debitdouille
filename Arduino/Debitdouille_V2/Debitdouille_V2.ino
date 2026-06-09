@@ -2,7 +2,9 @@
 #define V1          1  // Esp32 carte V1 (NodeMCU-32S)
 #define V2_C3       2  // carte V2 XIAO ESP32-C3
 #define V2_S3       3  // carte V2 XIAO ESP32-S3
-#define DEBITDOUILLE_VERSION V1  // <-- Modifier ici pour changer de version
+#ifndef DEBITDOUILLE_VERSION     // surchargé par platformio.ini (-D DEBITDOUILLE_VERSION=1/2/3)
+#define DEBITDOUILLE_VERSION V1  // <-- Modifier ici pour changer de version (IDE Arduino)
+#endif
 
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -18,12 +20,24 @@
 #endif
 #include <Adafruit_ADS1X15.h>
 #include <ArduinoJson.h>
+#include <Update.h>
+#include "mbedtls/sha256.h"
+#include "mbedtls/version.h"
+#include "freertos/stream_buffer.h"
 
 // ============================================
 // 📌 INFORMATIONS FIRMWARE
 // ============================================
+// Version surchargeable par la CI de release (-D FW_VERSION_MAJOR=... depuis le tag fw-vX.Y.Z)
+#ifndef FW_VERSION_MAJOR
 #define FW_VERSION_MAJOR 2// version majeure, rétrocompatibilité souhaitée dans les avec l'app dans une même version majeure.
-#define FW_VERSION_MINOR 1//TODO faire évoluer cela lors d'implémentation de fonctionnalités, en lien avec l'app flutter.
+#endif
+#ifndef FW_VERSION_MINOR
+#define FW_VERSION_MINOR 2//TODO faire évoluer cela lors d'implémentation de fonctionnalités, en lien avec l'app flutter.
+#endif
+#ifndef FW_VERSION_PATCH
+#define FW_VERSION_PATCH 0
+#endif
 #define FW_BUILD_DATE __DATE__  // Date de compilation automatique
 #define FW_BUILD_TIME __TIME__  // Heure de compilation automatique
 
@@ -267,6 +281,136 @@ String device_name = "debitdouille-";
 // Déclaration forward de la fonction LED
 void triggerLEDBlink(int count, int period_ms);
 
+// ============================================
+// 📦 OTA BLE — mise à jour du firmware depuis l'app Flutter
+// ============================================
+// Protocole complet : docs/ota.md. Résumé :
+//   1. App -> {"cmd":"ota_begin","size":N,"sha256":"...","esp_model":"...","chunk_size":X}
+//   2. ESP -> {"event":"ota_ready","chunk_size":X,"window_bytes":W} (après vérif modèle + Update.begin)
+//   3. App -> chunks binaires bruts sur RX ; ESP -> {"event":"ota_progress","bytes":N} (accusés
+//      de réception servant de flow control : l'app garde au plus W octets non confirmés en vol)
+//   4. À réception de `size` octets : vérif SHA-256, Update.end(), {"event":"ota_success"}, reboot.
+// Le callback BLE ne fait que copier les octets dans un stream buffer ; une tâche
+// éphémère (otaTransferTask) écrit la flash pour ne jamais bloquer la pile BLE.
+enum OtaState { OTA_IDLE, OTA_RECEIVING };
+volatile OtaState otaState = OTA_IDLE;
+volatile bool otaAbortRequest = false;
+uint32_t otaExpectedSize = 0;
+volatile uint32_t otaReceived = 0;
+uint8_t otaExpectedSha[32];
+StreamBufferHandle_t otaStreamBuf = NULL;
+TaskHandle_t taskOTA = NULL;
+
+#define OTA_STREAM_BUF_SIZE 12288  // > fenêtre + 1 chunk : ne déborde jamais grâce au flow control
+#define OTA_WINDOW_BYTES    8192   // octets non confirmés max autorisés à l'app
+#define OTA_ACK_STEP_BYTES  4096   // un ota_progress tous les N octets écrits en flash
+#define OTA_MAX_CHUNK       480    // borne haute du chunk_size négocié (l'app propose ≤ MTU-3)
+#define OTA_TIMEOUT_MS      30000  // session abandonnée si aucune donnée pendant ce délai
+
+// Compatibilité mbedtls 2.x (core Arduino 2.x / IDF4, API *_ret) et 3.x (core 3.x / IDF5)
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+  #define OTA_SHA256_STARTS(c)      mbedtls_sha256_starts(c, 0)
+  #define OTA_SHA256_UPDATE(c,d,l)  mbedtls_sha256_update(c, d, l)
+  #define OTA_SHA256_FINISH(c,o)    mbedtls_sha256_finish(c, o)
+#else
+  #define OTA_SHA256_STARTS(c)      mbedtls_sha256_starts_ret(c, 0)
+  #define OTA_SHA256_UPDATE(c,d,l)  mbedtls_sha256_update_ret(c, d, l)
+  #define OTA_SHA256_FINISH(c,o)    mbedtls_sha256_finish_ret(c, o)
+#endif
+
+void sendOtaEvent(const String &json) {
+    Serial.println("OTA -> " + json);
+    if (deviceConnected) {
+        pTxCharacteristic->setValue(json.c_str());
+        pTxCharacteristic->notify();
+    }
+}
+
+void otaCleanup() {
+    otaState = OTA_IDLE;
+    otaAbortRequest = false;
+    otaReceived = 0;
+    otaExpectedSize = 0;
+    if (otaStreamBuf != NULL) {
+        vStreamBufferDelete(otaStreamBuf);
+        otaStreamBuf = NULL;
+    }
+}
+
+// Convertit le SHA-256 hexadécimal (64 caractères) du manifest en 32 octets. false si invalide.
+bool parseShaHex(const char *hex, uint8_t *out) {
+    if (hex == NULL || strlen(hex) != 64) return false;
+    for (int i = 0; i < 32; i++) {
+        char hi = tolower(hex[2 * i]);
+        char lo = tolower(hex[2 * i + 1]);
+        if (!isxdigit(hi) || !isxdigit(lo)) return false;
+        uint8_t h = (hi <= '9') ? hi - '0' : hi - 'a' + 10;
+        uint8_t l = (lo <= '9') ? lo - '0' : lo - 'a' + 10;
+        out[i] = (h << 4) | l;
+    }
+    return true;
+}
+
+// Tâche éphémère créée par ota_begin : consomme le stream buffer rempli par le
+// callback BLE, écrit la flash, envoie les accusés ota_progress, puis finalise
+// (SHA-256 + Update.end) et reboote. S'autodétruit en cas d'erreur ou d'abort.
+void otaTransferTask(void *pvParameters) {
+    uint8_t buf[1024];
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    OTA_SHA256_STARTS(&sha);
+
+    uint32_t lastAckedBytes = 0;
+    unsigned long lastActivity = millis();
+    const char *failReason = NULL;
+
+    while (otaReceived < otaExpectedSize) {
+        size_t n = xStreamBufferReceive(otaStreamBuf, buf, sizeof(buf), pdMS_TO_TICKS(250));
+        if (otaAbortRequest) {
+            failReason = deviceConnected ? "aborted" : "ble_disconnected";
+            break;
+        }
+        if (n == 0) {
+            if (millis() - lastActivity > OTA_TIMEOUT_MS) { failReason = "timeout"; break; }
+            continue;
+        }
+        lastActivity = millis();
+        if (Update.write(buf, n) != n) { failReason = "flash_write"; break; }
+        OTA_SHA256_UPDATE(&sha, buf, n);
+        otaReceived += n;
+        if (otaReceived - lastAckedBytes >= OTA_ACK_STEP_BYTES || otaReceived >= otaExpectedSize) {
+            lastAckedBytes = otaReceived;
+            sendOtaEvent(String("{\"event\":\"ota_progress\",\"bytes\":") + otaReceived + "}");
+        }
+    }
+
+    if (failReason == NULL) {
+        uint8_t digest[32];
+        OTA_SHA256_FINISH(&sha, digest);
+        if (memcmp(digest, otaExpectedSha, 32) != 0) {
+            failReason = "sha_mismatch";
+        } else if (!Update.end(true)) {
+            failReason = "flash_end";
+        }
+    }
+    mbedtls_sha256_free(&sha);
+
+    if (failReason != NULL) {
+        if (Update.isRunning()) Update.abort();
+        Serial.printf("OTA: échec (%s) après %u octets\r\n", failReason, otaReceived);
+        sendOtaEvent(String("{\"event\":\"ota_error\",\"reason\":\"") + failReason + "\"}");
+        otaCleanup();
+        taskOTA = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    sendOtaEvent("{\"event\":\"ota_success\"}");
+    Serial.println("OTA: firmware écrit et vérifié, redémarrage...");
+    vTaskDelay(pdMS_TO_TICKS(700));  // laisser partir la notification avant le reboot
+    ESP.restart();
+}
+
 // Callbacks BLE pour gérer la connexion
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
@@ -279,6 +423,8 @@ class MyServerCallbacks: public BLEServerCallbacks {
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
       Serial.println("Client déconnecté");
+      // Une déconnexion pendant un transfert OTA annule la session (reprise impossible)
+      if (otaState == OTA_RECEIVING) otaAbortRequest = true;
       // Déclencher 1 clignotement long lors de la déconnexion (1000ms période)
       triggerLEDBlink(1, 1000);
     }
@@ -290,6 +436,23 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       std::string rxValue = pCharacteristic->getValue();
 
       if (rxValue.length() > 0) {
+        // Session OTA active : tout ce qui arrive sur RX est du binaire firmware.
+        // Exception : avant le tout premier chunk, un JSON (ota_abort) reste accepté —
+        // sans ambiguïté car un binaire ESP32 commence par le magic 0xE9, jamais par '{'.
+        if (otaState == OTA_RECEIVING) {
+          bool isPreStreamJson = (otaReceived == 0 &&
+                                  xStreamBufferIsEmpty(otaStreamBuf) == pdTRUE &&
+                                  rxValue[0] == '{');
+          if (!isPreStreamJson) {
+            size_t sent = xStreamBufferSend(otaStreamBuf, rxValue.data(), rxValue.length(), pdMS_TO_TICKS(200));
+            if (sent != rxValue.length()) {
+              // Ne devrait pas arriver (flow control par fenêtre) : le SHA-256 le détectera
+              Serial.println("OTA: stream buffer plein, octets perdus");
+            }
+            return;
+          }
+        }
+
         String receivedString = "";
         for (int i = 0; i < rxValue.length(); i++) {
           receivedString += rxValue[i];
@@ -327,6 +490,18 @@ class MyCallbacks: public BLECharacteristicCallbacks {
             newData = true;
             Serial.println("Commande JSON reçue: update_coeff");
           }
+          // Commandes OTA: {"cmd":"ota_begin"|"ota_abort"|"ota_rollback", ...}
+          else if (doc.containsKey("cmd")) {
+            const char *cmd = doc["cmd"];
+            if (strcmp(cmd, "ota_begin") == 0 || strcmp(cmd, "ota_abort") == 0 || strcmp(cmd, "ota_rollback") == 0) {
+              messageRecu = String(cmd);
+              valeurRecueStr = receivedString;  // Garder le JSON complet
+              newData = true;
+              Serial.println("Commande JSON reçue: " + messageRecu);
+            } else {
+              Serial.println("Commande JSON inconnue");
+            }
+          }
           else {
             Serial.println("Commande JSON inconnue");
           }
@@ -361,6 +536,9 @@ void setupBLE() {
     // Initialiser le périphérique BLE
     BLEDevice::init(device_name.c_str());
 
+    // MTU local élevé : permet à l'app de négocier de gros paquets (chunks OTA plus rapides)
+    BLEDevice::setMTU(517);
+
     // Créer le serveur BLE
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
@@ -376,9 +554,10 @@ void setupBLE() {
     pTxCharacteristic->addDescriptor(new BLE2902());
 
     // Créer la caractéristique RX (App -> ESP32)
+    // WRITE_NR (write without response) requis pour le streaming rapide des chunks OTA
     pRxCharacteristic = pService->createCharacteristic(
         BLE_RX_CHAR_UUID,
-        BLECharacteristic::PROPERTY_WRITE
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
     );
     pRxCharacteristic->setCallbacks(new MyCallbacks());
 
@@ -819,7 +998,9 @@ void taskSendBLE(void *pvParameters) {
     for(;;) {
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
 
-        if (deviceConnected) {
+        // Télémétrie suspendue pendant un transfert OTA (la bande passante BLE
+        // est réservée aux chunks et aux accusés ota_progress)
+        if (deviceConnected && otaState == OTA_IDLE) {
             // Copie locale des données (avec mutex)
             float local_pressure, local_sat, local_lon, local_llat, local_sspeed;
             float local_debit1, local_debit2, local_debit3, local_debit4;
@@ -1154,8 +1335,8 @@ void taskHandleCommands(void *pvParameters) {
                 // Créer le JSON de réponse avec les infos firmware
                 StaticJsonDocument<256> responseDoc;
 
-                // Construction de la version au format "X.Y"
-                String version = String(FW_VERSION_MAJOR) + "." + String(FW_VERSION_MINOR);
+                // Construction de la version au format "X.Y.Z" (aligné sur le manifest des releases)
+                String version = String(FW_VERSION_MAJOR) + "." + String(FW_VERSION_MINOR) + "." + String(FW_VERSION_PATCH);
 
                 responseDoc["fw_version"] = version;
                 responseDoc["build_date"] = FW_BUILD_DATE;
@@ -1339,6 +1520,87 @@ void taskHandleCommands(void *pvParameters) {
                     Serial.println("Erreur parsing update_coeff JSON");
                 }
 
+                messageRecu = "";
+            }
+
+            // ========== COMMANDE OTA_BEGIN (MISE À JOUR FIRMWARE PAR BLE) ==========
+            else if (messageRecu == "ota_begin") {
+                StaticJsonDocument<512> doc;
+                DeserializationError err = deserializeJson(doc, valeurRecueStr);
+                String errorJson = "";
+
+                if (otaState != OTA_IDLE || taskOTA != NULL) {
+                    errorJson = "{\"event\":\"ota_error\",\"reason\":\"already_running\"}";
+                }
+                else if (err || !doc.containsKey("size") || !doc.containsKey("sha256") || !doc.containsKey("esp_model")) {
+                    errorJson = "{\"event\":\"ota_error\",\"reason\":\"bad_request\"}";
+                }
+                // Protection anti-brick : refus si le binaire ne cible pas exactement ce modèle
+                else if (strcmp(doc["esp_model"] | "", FW_ESP_MODEL) != 0) {
+                    errorJson = String("{\"event\":\"ota_error\",\"reason\":\"model_mismatch\",\"expected\":\"")
+                                + FW_ESP_MODEL + "\",\"got\":\"" + (doc["esp_model"] | "") + "\"}";
+                }
+                else if (!parseShaHex(doc["sha256"] | "", otaExpectedSha)) {
+                    errorJson = "{\"event\":\"ota_error\",\"reason\":\"bad_sha256\"}";
+                }
+                else {
+                    uint32_t size = doc["size"];
+                    if (size == 0 || !Update.begin(size)) {
+                        errorJson = "{\"event\":\"ota_error\",\"reason\":\"size_too_large\"}";
+                    } else {
+                        otaStreamBuf = xStreamBufferCreate(OTA_STREAM_BUF_SIZE, 1);
+                        if (otaStreamBuf == NULL) {
+                            Update.abort();
+                            errorJson = "{\"event\":\"ota_error\",\"reason\":\"no_memory\"}";
+                        } else {
+                            otaExpectedSize = size;
+                            otaReceived = 0;
+                            otaAbortRequest = false;
+                            uint32_t chunkSize = doc["chunk_size"] | 240;
+                            chunkSize = constrain(chunkSize, (uint32_t)20, (uint32_t)OTA_MAX_CHUNK);
+                            if (xTaskCreatePinnedToCore(otaTransferTask, "OtaTransfer", 8192, NULL, 3, &taskOTA, 1) != pdPASS) {
+                                Update.abort();
+                                otaCleanup();
+                                errorJson = "{\"event\":\"ota_error\",\"reason\":\"no_memory\"}";
+                            } else {
+                                // RECEIVING avant le notify : le premier chunk peut arriver juste derrière
+                                otaState = OTA_RECEIVING;
+                                Serial.printf("OTA: session ouverte, %u octets attendus, chunk=%u\r\n", size, chunkSize);
+                                sendOtaEvent(String("{\"event\":\"ota_ready\",\"chunk_size\":") + chunkSize
+                                             + ",\"window_bytes\":" + OTA_WINDOW_BYTES + "}");
+                            }
+                        }
+                    }
+                }
+
+                if (errorJson.length() > 0) sendOtaEvent(errorJson);
+                messageRecu = "";
+            }
+
+            // ========== COMMANDE OTA_ABORT ==========
+            else if (messageRecu == "ota_abort") {
+                // N'est reçue qu'avant le premier chunk (pendant le streaming, RX = binaire ;
+                // l'annulation en cours de transfert passe par une déconnexion BLE)
+                if (otaState == OTA_RECEIVING) {
+                    otaAbortRequest = true;  // otaTransferTask répondra ota_error/aborted et nettoiera
+                } else {
+                    sendOtaEvent("{\"event\":\"ota_error\",\"reason\":\"no_session\"}");
+                }
+                messageRecu = "";
+            }
+
+            // ========== COMMANDE OTA_ROLLBACK ==========
+            else if (messageRecu == "ota_rollback") {
+                // Rebascule manuellement sur la partition OTA précédente si elle contient
+                // encore une image valide (dépannage après une mise à jour problématique)
+                if (otaState == OTA_IDLE && Update.canRollBack()) {
+                    sendOtaEvent("{\"event\":\"ota_rollback_ok\"}");
+                    vTaskDelay(pdMS_TO_TICKS(700));  // laisser partir la notification
+                    Update.rollBack();
+                    ESP.restart();
+                } else {
+                    sendOtaEvent("{\"event\":\"ota_error\",\"reason\":\"no_backup\"}");
+                }
                 messageRecu = "";
             }
 

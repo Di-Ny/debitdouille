@@ -183,6 +183,12 @@ class DataProvider with ChangeNotifier {
         return;
       }
 
+      if (j.containsKey('event')) {
+        // Événement OTA (ota_ready, ota_progress, ota_success...) - ne pas le
+        // traiter ici (géré par performOtaTransfer / firmware_update_screen)
+        return;
+      }
+
       // Sinon, c'est une trame data normale
       // On applique la moyenne glissante sur les valeurs brutes avant affichage.
       data = _filter.process(CapteurData.fromJson(j));
