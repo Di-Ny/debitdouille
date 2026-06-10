@@ -29,6 +29,27 @@ class FirmwareBinary {
   );
 }
 
+/// Référence légère d'une release firmware GitHub (tag `fw-vX.Y.Z`), sans son
+/// manifest — sert à lister les versions installables en une seule requête API.
+class FirmwareReleaseSummary {
+  final String version; // ex. "2.3.0" (tag sans le préfixe fw-v)
+  final String tagName; // ex. "fw-v2.3.0"
+  final String publishedAt; // date ISO (vide si inconnue)
+  final Map<String, String> assetUrls; // nom d'asset -> browser_download_url
+
+  FirmwareReleaseSummary({
+    required this.version,
+    required this.tagName,
+    required this.publishedAt,
+    required this.assetUrls,
+  });
+
+  String? get manifestUrl {
+    final url = assetUrls['manifest.json'];
+    return (url == null || url.isEmpty) ? null : url;
+  }
+}
+
 /// Une release firmware GitHub (tag `fw-vX.Y.Z`) décrite par son manifest.json.
 class FirmwareRelease {
   final String version; // ex. "2.3.0"

@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/firmware_release.dart';
@@ -65,50 +67,78 @@ class FirmwareUpdateService {
   }
 
   Future<FirmwareRelease?> _fetchFromGitHub() async {
-    // Liste des releases (les plus récentes d'abord) plutôt que /latest :
-    // le dépôt peut aussi publier des releases de l'app, on filtre par tag fw-v.
+    final list = await fetchReleaseList();
+    if (list.isEmpty) return null;
+    return fetchRelease(list.first);
+  }
+
+  /// Liste des releases firmware publiées (les plus récentes d'abord), sans
+  /// leur manifest — une seule requête API. Permet de choisir une version
+  /// précise (y compris plus ancienne, en cas de régression terrain).
+  Future<List<FirmwareReleaseSummary>> fetchReleaseList() async {
+    // Liste des releases plutôt que /latest : le dépôt peut aussi publier des
+    // releases de l'app, on filtre par tag fw-v.
     final resp = await http.get(
       Uri.parse(
-          'https://api.github.com/repos/$repoOwner/$repoName/releases?per_page=15'),
+          'https://api.github.com/repos/$repoOwner/$repoName/releases?per_page=30'),
       headers: {'Accept': 'application/vnd.github+json'},
     ).timeout(const Duration(seconds: 15));
     if (resp.statusCode != 200) {
       throw Exception('GitHub a répondu ${resp.statusCode} — réessayez plus tard.');
     }
 
-    final releases = jsonDecode(resp.body) as List;
-    for (final r in releases) {
+    final summaries = <FirmwareReleaseSummary>[];
+    for (final r in jsonDecode(resp.body) as List) {
       final tag = r['tag_name'] as String? ?? '';
       if (!tag.startsWith(_tagPrefix)) continue;
       if (r['draft'] == true || r['prerelease'] == true) continue;
 
-      final assets = (r['assets'] as List? ?? []);
       final assetUrls = <String, String>{
-        for (final a in assets)
+        for (final a in (r['assets'] as List? ?? []))
           (a['name'] as String? ?? ''): (a['browser_download_url'] as String? ?? ''),
       };
-      final manifestUrl = assetUrls['manifest.json'];
-      if (manifestUrl == null || manifestUrl.isEmpty) continue;
-
-      final mResp = await http
-          .get(Uri.parse(manifestUrl))
-          .timeout(const Duration(seconds: 15));
-      if (mResp.statusCode != 200) {
-        throw Exception('Téléchargement du manifest impossible (${mResp.statusCode}).');
+      if (assetUrls['manifest.json'] == null || assetUrls['manifest.json']!.isEmpty) {
+        continue; // release sans manifest → pas une release firmware exploitable
       }
-      return FirmwareRelease.fromManifest(
-        jsonDecode(utf8.decode(mResp.bodyBytes)) as Map<String, dynamic>,
-        assetUrls,
-      );
+      summaries.add(FirmwareReleaseSummary(
+        version: tag.substring(_tagPrefix.length),
+        tagName: tag,
+        publishedAt: (r['published_at'] as String? ?? '').split('T').first,
+        assetUrls: assetUrls,
+      ));
     }
-    return null;
+    return summaries;
+  }
+
+  /// Manifest complet d'une release listée par [fetchReleaseList].
+  Future<FirmwareRelease> fetchRelease(FirmwareReleaseSummary summary) async {
+    final mResp = await http
+        .get(Uri.parse(summary.manifestUrl!))
+        .timeout(const Duration(seconds: 15));
+    if (mResp.statusCode != 200) {
+      throw Exception('Téléchargement du manifest impossible (${mResp.statusCode}).');
+    }
+    return FirmwareRelease.fromManifest(
+      jsonDecode(utf8.decode(mResp.bodyBytes)) as Map<String, dynamic>,
+      summary.assetUrls,
+    );
   }
 
   /// Télécharge un binaire firmware et vérifie son SHA-256 contre le manifest.
+  ///
+  /// Le binaire validé est conservé sur disque (indexé par son SHA-256) : un
+  /// appel ultérieur le sert sans réseau — permet de pré-télécharger une mise
+  /// à jour en Wi-Fi puis de l'installer au champ sans connexion.
   Future<Uint8List> downloadBinary(
     FirmwareBinary binary, {
     void Function(int received, int total)? onProgress,
   }) async {
+    final cached = await _readCachedBinary(binary);
+    if (cached != null) {
+      onProgress?.call(cached.length, cached.length);
+      return cached;
+    }
+
     final client = http.Client();
     try {
       final resp = await client
@@ -131,9 +161,49 @@ class FirmwareUpdateService {
         throw Exception(
             'Le fichier téléchargé est corrompu (SHA-256 invalide). Réessayez.');
       }
+      await _writeCachedBinary(binary, bytes);
       return bytes;
     } finally {
       client.close();
     }
+  }
+
+  /// true si le binaire est déjà sur disque (installation possible hors connexion).
+  Future<bool> isBinaryCached(FirmwareBinary binary) async =>
+      await _readCachedBinary(binary) != null;
+
+  Future<Directory> _cacheDir() async {
+    final base = await getApplicationCacheDirectory();
+    final dir = Directory('${base.path}${Platform.pathSeparator}firmware');
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
+  }
+
+  File _cacheFile(Directory dir, FirmwareBinary binary) =>
+      File('${dir.path}${Platform.pathSeparator}firmware_${binary.sha256.toLowerCase()}.bin');
+
+  /// Binaire en cache disque, revérifié par SHA-256 (supprimé si corrompu).
+  Future<Uint8List?> _readCachedBinary(FirmwareBinary binary) async {
+    try {
+      final file = _cacheFile(await _cacheDir(), binary);
+      if (!await file.exists()) return null;
+      final bytes = await file.readAsBytes();
+      if (sha256.convert(bytes).toString() == binary.sha256.toLowerCase()) {
+        return bytes;
+      }
+      await file.delete();
+    } catch (_) {/* cache disque indisponible → comportement réseau normal */}
+    return null;
+  }
+
+  /// Écrit le binaire validé dans le cache, en purgeant les versions précédentes.
+  Future<void> _writeCachedBinary(FirmwareBinary binary, Uint8List bytes) async {
+    try {
+      final dir = await _cacheDir();
+      await for (final f in dir.list()) {
+        if (f is File && f.path.contains('firmware_')) await f.delete();
+      }
+      await _cacheFile(dir, binary).writeAsBytes(bytes, flush: true);
+    } catch (_) {/* échec d'écriture non bloquant : le flash utilise les bytes en RAM */}
   }
 }

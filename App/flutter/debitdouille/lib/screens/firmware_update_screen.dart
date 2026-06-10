@@ -45,6 +45,7 @@ class _FirmwareUpdateScreenState extends State<FirmwareUpdateScreen> {
   FirmwareRelease? _release;
   double _progress = 0; // 0..1 pour downloading/transferring
   String _verifiedVersion = ''; // version relue après reboot
+  bool _binaryCached = false; // binaire déjà sur disque → installable hors connexion
 
   bool get _busy =>
       _phase == _Phase.downloading ||
@@ -103,9 +104,12 @@ class _FirmwareUpdateScreenState extends State<FirmwareUpdateScreen> {
     try {
       final info = await _readEspInfo();
       final release = await _updateService.fetchLatestRelease(forceRefresh: forceRefresh);
+      final binary = release?.binaryFor(info.espModel);
+      final cached = binary != null && await _updateService.isBinaryCached(binary);
 
       if (!mounted) return;
       setState(() {
+        _binaryCached = cached;
         _espInfo = info;
         _release = release;
         if (release == null ||
@@ -132,10 +136,154 @@ class _FirmwareUpdateScreenState extends State<FirmwareUpdateScreen> {
     }
   }
 
-  Future<void> _startUpdate() async {
+  /// Sélecteur de version : liste toutes les releases publiées (récentes en
+  /// tête) et permet d'en installer une précise — y compris plus ancienne que
+  /// l'actuelle, pour revenir en arrière après une régression.
+  Future<void> _chooseVersion() async {
+    final List<FirmwareReleaseSummary> releases;
+    try {
+      releases = await _updateService.fetchReleaseList();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text("Liste des versions indisponible : "
+              "${e.toString().replaceFirst('Exception: ', '')}")));
+      return;
+    }
+    if (!mounted || releases.isEmpty) return;
+
+    final installed = _espInfo?.version ?? '';
+    final summary = await showModalBottomSheet<FirmwareReleaseSummary>(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      builder: (ctx) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text("Choisir une version à installer",
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold)),
+            ),
+            for (final r in releases)
+              ListTile(
+                title: Text(r.version,
+                    style: const TextStyle(color: Colors.white, fontSize: 16)),
+                subtitle: Text(
+                  r.publishedAt.isNotEmpty ? r.publishedAt : r.tagName,
+                  style: const TextStyle(color: Colors.white54, fontSize: 13),
+                ),
+                trailing: compareVersions(r.version, installed) == 0
+                    ? const Text("installée",
+                        style: TextStyle(color: Colors.green, fontSize: 13))
+                    : compareVersions(r.version, installed) < 0
+                        ? const Icon(Icons.history, color: Colors.orange, size: 20)
+                        : const Icon(Icons.upgrade, color: Colors.white54, size: 20),
+                onTap: () => Navigator.of(ctx).pop(r),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (summary == null || !mounted) return;
+
+    // Confirmation explicite, avec avertissement en cas de retour arrière
+    final isDowngrade = compareVersions(summary.version, installed) < 0;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: Text("Installer la version ${summary.version} ?",
+            style: const TextStyle(color: Colors.white)),
+        content: Text(
+          "Firmware actuel : $installed.\n"
+          "${isDowngrade ? "⚠️ Vous installez une version plus ancienne que "
+              "l'actuelle. Les réglages sont conservés mais certaines "
+              "fonctionnalités récentes peuvent disparaître.\n\n" : ""}"
+          "Le transfert Bluetooth prend plusieurs minutes.",
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text("Annuler")),
+          TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text("Installer")),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    try {
+      final release = await _updateService.fetchRelease(summary);
+      if (!mounted) return;
+      if (release.binaryFor(_espInfo!.espModel) == null) {
+        setState(() {
+          _phase = _Phase.error;
+          _errorMessage = "La version ${release.version} ne contient pas de "
+              "binaire pour le modèle « ${_espInfo!.espModel} ».";
+        });
+        return;
+      }
+      if (release.minAppVersion.isNotEmpty &&
+          compareVersions(AppVersion.version, release.minAppVersion) < 0) {
+        setState(() {
+          _phase = _Phase.error;
+          _errorMessage = "La version ${release.version} nécessite "
+              "l'application ${release.minAppVersion} minimum.";
+        });
+        return;
+      }
+      await _startUpdate(release);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _phase = _Phase.error;
+        _errorMessage = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  /// Télécharge le binaire dans le cache disque sans flasher : permet de
+  /// préparer la mise à jour en Wi-Fi puis de l'installer au champ hors connexion.
+  Future<void> _predownload() async {
+    final release = _release!;
+    final binary = release.binaryFor(_espInfo!.espModel)!;
+    setState(() {
+      _phase = _Phase.downloading;
+      _progress = 0;
+    });
+    try {
+      await _updateService.downloadBinary(
+        binary,
+        onProgress: (received, total) {
+          if (mounted && total > 0) setState(() => _progress = received / total);
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _binaryCached = true;
+        _phase = _Phase.updateAvailable;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _phase = _Phase.error;
+        _errorMessage = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  /// Lance la mise à jour vers [target] (par défaut la dernière release
+  /// détectée) — sert aussi à installer une version plus ancienne.
+  Future<void> _startUpdate([FirmwareRelease? target]) async {
     final dataProvider = context.read<DataProvider>();
     final ble = dataProvider.ble;
-    final release = _release!;
+    final release = target ?? _release!;
     final info = _espInfo!;
     final binary = release.binaryFor(info.espModel)!;
 
@@ -188,12 +336,13 @@ class _FirmwareUpdateScreenState extends State<FirmwareUpdateScreen> {
       setState(() {
         _verifiedVersion = newInfo.version;
         _espInfo = newInfo;
-        if (compareVersions(newInfo.version, release.version) >= 0) {
+        // Égalité stricte : la cible peut aussi être une version plus ancienne
+        if (compareVersions(newInfo.version, release.version) == 0) {
           _phase = _Phase.success;
         } else {
           _phase = _Phase.error;
           _errorMessage =
-              "L'ESP s'est reconnecté mais annonce toujours la version "
+              "L'ESP s'est reconnecté mais annonce la version "
               "${newInfo.version} (attendu ${release.version}).";
         }
       });
@@ -308,6 +457,9 @@ class _FirmwareUpdateScreenState extends State<FirmwareUpdateScreen> {
           const SizedBox(height: 16),
           _actionButton("Revérifier", Icons.refresh,
               () => _check(forceRefresh: true)),
+          const SizedBox(height: 12),
+          _secondaryButton("Installer une autre version…", Icons.history,
+              _chooseVersion),
         ];
 
       case _Phase.appTooOld:
@@ -345,6 +497,33 @@ class _FirmwareUpdateScreenState extends State<FirmwareUpdateScreen> {
           ),
           const SizedBox(height: 16),
           _actionButton("Mettre à jour", Icons.system_update_alt, _startUpdate),
+          const SizedBox(height: 12),
+          // Plusieurs mises à jour de retard ? Revérifier sans quitter l'écran.
+          _secondaryButton("Revérifier", Icons.refresh,
+              () => _check(forceRefresh: true)),
+          const SizedBox(height: 12),
+          _secondaryButton("Installer une autre version…", Icons.history,
+              _chooseVersion),
+          const SizedBox(height: 12),
+          if (_binaryCached)
+            Row(
+              children: const [
+                Icon(Icons.offline_pin, color: Colors.green, size: 20),
+                SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    "Firmware déjà téléchargé — installation possible même "
+                    "sans connexion Internet.",
+                    style: TextStyle(color: Colors.white70, fontSize: 14),
+                  ),
+                ),
+              ],
+            )
+          else
+            _secondaryButton(
+                "Pré-télécharger (installation hors connexion plus tard)",
+                Icons.download,
+                _predownload),
         ];
 
       case _Phase.downloading:
@@ -421,6 +600,22 @@ class _FirmwareUpdateScreenState extends State<FirmwareUpdateScreen> {
           backgroundColor: Colors.white,
           foregroundColor: Colors.black,
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+        ),
+      ),
+    );
+  }
+
+  Widget _secondaryButton(String label, IconData icon, VoidCallback onPressed) {
+    return Center(
+      child: OutlinedButton.icon(
+        onPressed: onPressed,
+        icon: Icon(icon, color: Colors.white),
+        label: Text(label,
+            style: const TextStyle(color: Colors.white),
+            textAlign: TextAlign.center),
+        style: OutlinedButton.styleFrom(
+          side: const BorderSide(color: Colors.white54),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
         ),
       ),
     );
