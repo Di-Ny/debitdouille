@@ -1,0 +1,96 @@
+# =============================================================================
+# Codemagic CI/CD — Pulvérisateur (Débitdouille)
+# Build iOS sur Mac hébergé + signature automatique (clé API App Store Connect)
+# + upload vers App Store Connect / TestFlight. Aucun Mac local requis.
+#
+# Réutilise l'intégration App Store Connect "FURGO_ASC" (même compte Apple,
+# Team ID D284NZAZ6C). L'app n'a aucun secret de build → pas de groupe de
+# variables ni de configs.user.json (contrairement à FURGO).
+# =============================================================================
+
+workflows:
+  ios-testflight:
+    name: iOS – Build & TestFlight (Pulvérisateur)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    integrations:
+      # Doit correspondre au nom de la clé API dans Codemagic > Integrations.
+      app_store_connect: FURGO_ASC
+    environment:
+      flutter: 3.35.2          # version épinglée = version de dev locale
+      xcode: latest            # Apple impose le SDK iOS 26+ (Xcode 26+) à l'upload
+      cocoapods: default
+      vars:
+        BUNDLE_ID: "fr.furgo.pulverisateur"
+        APP_STORE_APP_ID: "6783067937"   # app "Pulvérisateur" dans App Store Connect
+    scripts:
+      - name: Flutter pub get
+        script: flutter pub get
+      - name: Pod install (résolution fraîche)
+        script: |
+          set -e
+          cd ios
+          rm -f Podfile.lock
+          pod install --repo-update
+          cd ..
+      - name: Nettoyer les certificats de distribution orphelins
+        script: |
+          # La clé privée n'étant pas persistée, les certificats précédents sont
+          # inutilisables et consomment les emplacements limités par Apple. On les
+          # révoque avant d'en recréer un (mêmes variables ASC que FURGO).
+          node <<'NODE' || true
+          const c=require('crypto'),h=require('https');
+          let pem=process.env.APP_STORE_CONNECT_PRIVATE_KEY||'';
+          pem=pem.replace(/\\n/g,'\n').trim();
+          if(pem && !/BEGIN/.test(pem)){const body=pem.replace(/\s+/g,'').replace(/(.{64})/g,'$1\n').replace(/\n$/,'');pem='-----BEGIN PRIVATE KEY-----\n'+body+'\n-----END PRIVATE KEY-----\n';}
+          const kid=process.env.APP_STORE_CONNECT_KEY_IDENTIFIER, iss=process.env.APP_STORE_CONNECT_ISSUER_ID;
+          if(!pem||!kid||!iss){console.log('Variables ASC absentes, étape ignorée');process.exit(0);}
+          const now=Math.floor(Date.now()/1000);
+          const b=o=>Buffer.from(JSON.stringify(o)).toString('base64url');
+          const si=b({alg:'ES256',kid,typ:'JWT'})+'.'+b({iss,iat:now,exp:now+600,aud:'appstoreconnect-v1'});
+          const jwt=si+'.'+c.sign('SHA256',Buffer.from(si),{key:pem,dsaEncoding:'ieee-p1363'}).toString('base64url');
+          const rq=(m,p)=>new Promise((res,rej)=>{const r=h.request({host:'api.appstoreconnect.apple.com',path:p,method:m,headers:{Authorization:'Bearer '+jwt}},x=>{let d='';x.on('data',k=>d+=k);x.on('end',()=>res({s:x.statusCode,d}))});r.on('error',rej);r.end()});
+          (async()=>{const r=await rq('GET','/v1/certificates?limit=200');const ds=(JSON.parse(r.d).data||[]).filter(x=>/DISTRIBUTION/.test(x.attributes.certificateType));console.log('Certificats DISTRIBUTION:',ds.length);for(const x of ds){const z=await rq('DELETE','/v1/certificates/'+x.id);console.log('  révoqué',x.id,z.s)}})();
+          NODE
+      - name: Signature iOS (création auto du certificat + profil via clé API)
+        script: |
+          set -e
+          keychain initialize
+          if [ -z "$CERTIFICATE_PRIVATE_KEY" ]; then
+            export CERTIFICATE_PRIVATE_KEY="$(openssl genrsa 2048 2>/dev/null)"
+            echo "Clé privée générée pour ce build"
+          fi
+          app-store-connect fetch-signing-files "$BUNDLE_ID" \
+            --type IOS_APP_STORE \
+            --certificate-key=@env:CERTIFICATE_PRIVATE_KEY \
+            --create
+          keychain add-certificates
+          xcode-project use-profiles
+      - name: Build IPA
+        script: |
+          set -e
+          # Numéro de build = (dernier build App Store Connect + 1), démarre à 1.
+          LATEST=$(app-store-connect get-latest-app-store-build-number "$APP_STORE_APP_ID" 2>/dev/null || echo 0)
+          BN=$((LATEST + 1))
+          echo "Build number = $BN"
+          flutter build ipa --release \
+            --no-tree-shake-icons \
+            --build-number=$BN \
+            --dart-define=BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M)" \
+            --export-options-plist=/Users/builder/export_options.plist
+      - name: Upload vers App Store Connect (sans attendre le processing)
+        script: |
+          set -e
+          app-store-connect publish \
+            --path 'build/ios/ipa/*.ipa' \
+            --max-build-processing-wait 0
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      email:
+        recipients:
+          - nicolas.dauy@gmail.com
+        notify:
+          success: true
+          failure: true

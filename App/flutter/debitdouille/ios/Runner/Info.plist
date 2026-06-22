@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Debitdouille</string>
+	<string>Pulvérisateur</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -45,5 +45,9 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Pulvérisateur utilise le Bluetooth pour se connecter à votre contrôleur de pulvérisation et lire les mesures de débit en temps réel.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Pulvérisateur utilise le Bluetooth pour se connecter à votre contrôleur de pulvérisation et lire les mesures de débit en temps réel.</string>
 </dict>
 </plist>
