@@ -94,3 +94,53 @@ workflows:
         notify:
           success: true
           failure: true
+
+  # ---------------------------------------------------------------------------
+  # Captures d'écran App Store (simulateur iPhone Pro Max, 6,9")
+  # Données injectées via DataProvider.pushSimulatedFrame (pas d'appareil BLE).
+  # ---------------------------------------------------------------------------
+  ios-screenshots:
+    name: iOS – Captures App Store (Pulvérisateur)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: 3.35.2
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Flutter pub get
+        script: flutter pub get
+      - name: Pod install (résolution fraîche)
+        script: |
+          set -e
+          cd ios && rm -f Podfile.lock && pod install --repo-update && cd ..
+      - name: Boot simulateur 6,9" + captures (integration_test)
+        script: |
+          set -e
+          echo "--- Simulateurs iPhone disponibles ---"
+          xcrun simctl list devices available | grep -i "iPhone" || true
+          UDID=$(xcrun simctl list devices available | grep -E "iPhone.*Pro Max" | grep -oiE "[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}" | head -1)
+          if [ -z "$UDID" ]; then
+            echo "Pas de Pro Max, repli sur un iPhone quelconque"
+            UDID=$(xcrun simctl list devices available | grep -E "iPhone" | grep -oiE "[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}" | head -1)
+          fi
+          if [ -z "$UDID" ]; then echo "Aucun simulateur iPhone disponible"; exit 1; fi
+          echo "Simulateur UDID=$UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b || true
+          xcrun simctl status_bar "$UDID" override --time "9:41" --batteryState charged --batteryLevel 100 --cellularBars 4 --wifiBars 3 || true
+          flutter drive \
+            --driver=test_driver/integration_test.dart \
+            --target=integration_test/screenshots_test.dart \
+            -d "$UDID"
+      - name: Lister les captures
+        script: ls -la screenshots || true
+    artifacts:
+      - screenshots/*.png
+    publishing:
+      email:
+        recipients:
+          - nicolas.dauy@gmail.com
+        notify:
+          success: true
+          failure: true
