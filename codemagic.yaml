@@ -9,8 +9,12 @@
 # ⚠️ Les chemins `artifacts:` sont résolus depuis la RACINE DU CLONE (pas depuis
 # working_directory) → ils sont préfixés par App/flutter/debitdouille/.
 #
-# Réutilise l'intégration App Store Connect "FURGO_ASC" (même compte Apple,
-# Team ID D284NZAZ6C). L'app n'a aucun secret de build.
+# SIGNATURE : le compte Apple est partagé avec FURGO (limite Apple ~2 certificats
+# de distribution). Pour ne PAS créer/révoquer de certificat à chaque build (ce
+# qui saturait la limite et risquait de révoquer celui de FURGO), on PERSISTE une
+# clé RSA dédiée dans la variable sécurisée CERTIFICATE_PRIVATE_KEY (groupe
+# debitdouille_ios). fetch-signing-files réutilise alors toujours le même
+# certificat. Intégration App Store Connect "FURGO_ASC" (Team D284NZAZ6C).
 # =============================================================================
 
 workflows:
@@ -20,12 +24,13 @@ workflows:
     max_build_duration: 120
     working_directory: App/flutter/debitdouille
     integrations:
-      # Doit correspondre au nom de la clé API dans Codemagic > Integrations.
       app_store_connect: FURGO_ASC
     environment:
-      flutter: 3.35.2          # version épinglée = version de dev locale
-      xcode: latest            # Apple impose le SDK iOS 26+ (Xcode 26+) à l'upload
+      flutter: 3.35.2
+      xcode: latest
       cocoapods: default
+      groups:
+        - debitdouille_ios     # contient CERTIFICATE_PRIVATE_KEY (clé du certificat, persistée)
       vars:
         BUNDLE_ID: "fr.furgo.pulverisateur"
         APP_STORE_APP_ID: "6783067937"
@@ -39,32 +44,17 @@ workflows:
           rm -f Podfile.lock
           pod install --repo-update
           cd ..
-      - name: Nettoyer les certificats de distribution orphelins
-        script: |
-          # La clé privée n'étant pas persistée, les certificats précédents sont
-          # inutilisables et consomment les emplacements limités par Apple. On les
-          # révoque avant d'en recréer un (mêmes variables ASC que FURGO).
-          node <<'NODE' || true
-          const c=require('crypto'),h=require('https');
-          let pem=process.env.APP_STORE_CONNECT_PRIVATE_KEY||'';
-          pem=pem.replace(/\\n/g,'\n').trim();
-          if(pem && !/BEGIN/.test(pem)){const body=pem.replace(/\s+/g,'').replace(/(.{64})/g,'$1\n').replace(/\n$/,'');pem='-----BEGIN PRIVATE KEY-----\n'+body+'\n-----END PRIVATE KEY-----\n';}
-          const kid=process.env.APP_STORE_CONNECT_KEY_IDENTIFIER, iss=process.env.APP_STORE_CONNECT_ISSUER_ID;
-          if(!pem||!kid||!iss){console.log('Variables ASC absentes, étape ignorée');process.exit(0);}
-          const now=Math.floor(Date.now()/1000);
-          const b=o=>Buffer.from(JSON.stringify(o)).toString('base64url');
-          const si=b({alg:'ES256',kid,typ:'JWT'})+'.'+b({iss,iat:now,exp:now+600,aud:'appstoreconnect-v1'});
-          const jwt=si+'.'+c.sign('SHA256',Buffer.from(si),{key:pem,dsaEncoding:'ieee-p1363'}).toString('base64url');
-          const rq=(m,p)=>new Promise((res,rej)=>{const r=h.request({host:'api.appstoreconnect.apple.com',path:p,method:m,headers:{Authorization:'Bearer '+jwt}},x=>{let d='';x.on('data',k=>d+=k);x.on('end',()=>res({s:x.statusCode,d}))});r.on('error',rej);r.end()});
-          (async()=>{const r=await rq('GET','/v1/certificates?limit=200');const ds=(JSON.parse(r.d).data||[]).filter(x=>/DISTRIBUTION/.test(x.attributes.certificateType));console.log('Certificats DISTRIBUTION:',ds.length);for(const x of ds){const z=await rq('DELETE','/v1/certificates/'+x.id);console.log('  révoqué',x.id,z.s)}})();
-          NODE
-      - name: Signature iOS (création auto du certificat + profil via clé API)
+      - name: Signature iOS (certificat réutilisé via clé persistée)
         script: |
           set -e
           keychain initialize
+          # CERTIFICATE_PRIVATE_KEY est persistée (groupe debitdouille_ios) → on
+          # réutilise le MÊME certificat de distribution à chaque build. --create
+          # ne crée un certificat que s'il n'en existe pas encore pour cette clé
+          # (1er build). On ne révoque rien : le certificat de FURGO n'est jamais
+          # touché sur le compte partagé.
           if [ -z "$CERTIFICATE_PRIVATE_KEY" ]; then
-            export CERTIFICATE_PRIVATE_KEY="$(openssl genrsa 2048 2>/dev/null)"
-            echo "Clé privée générée pour ce build"
+            echo "ERREUR : CERTIFICATE_PRIVATE_KEY absente (groupe debitdouille_ios non importé ?)"; exit 1
           fi
           app-store-connect fetch-signing-files "$BUNDLE_ID" \
             --type IOS_APP_STORE \
@@ -104,6 +94,7 @@ workflows:
   # ---------------------------------------------------------------------------
   # Captures d'écran App Store (simulateur iPhone Pro Max, 6,9")
   # Données injectées via DataProvider.pushSimulatedFrame (pas d'appareil BLE).
+  # Pas de signature → pas besoin du certificat.
   # ---------------------------------------------------------------------------
   ios-screenshots:
     name: iOS – Captures App Store (Pulvérisateur)
