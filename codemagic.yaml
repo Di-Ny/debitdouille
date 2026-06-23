@@ -81,7 +81,8 @@ workflows:
             --path 'build/ios/ipa/*.ipa' \
             --max-build-processing-wait 0
     artifacts:
-      - App/flutter/debitdouille/build/ios/ipa/*.ipa
+      # Chemins relatifs au working_directory (App/flutter/debitdouille).
+      - build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log
     publishing:
       email:
@@ -134,7 +135,8 @@ workflows:
       - name: Lister les captures
         script: ls -la screenshots || true
     artifacts:
-      - App/flutter/debitdouille/screenshots/*.png
+      # Chemin relatif au working_directory (App/flutter/debitdouille).
+      - screenshots/*.png
     publishing:
       email:
         recipients:
