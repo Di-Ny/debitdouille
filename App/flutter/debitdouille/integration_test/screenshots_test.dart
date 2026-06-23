@@ -14,7 +14,6 @@ import 'package:integration_test/integration_test.dart';
 import 'package:provider/provider.dart';
 
 import 'package:debitdouille/main.dart';
-import 'package:debitdouille/utils/app_version.dart';
 import 'package:debitdouille/widgets/app_shell.dart';
 import 'package:debitdouille/providers/data_provider.dart';
 import 'package:debitdouille/providers/settings_provider.dart';
@@ -42,7 +41,6 @@ void main() {
   }
 
   testWidgets('Captures App Store', (tester) async {
-    await AppVersion.init();
     final settings = SettingsProvider();
     await settings.load();
     await settings.setPairs(2); // 2 débitmètres par côté : écran d'accueil rempli
