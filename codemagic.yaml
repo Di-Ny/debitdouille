@@ -3,9 +3,14 @@
 # Build iOS sur Mac hébergé + signature automatique (clé API App Store Connect)
 # + upload vers App Store Connect / TestFlight. Aucun Mac local requis.
 #
+# IMPORTANT (monorepo) : ce fichier DOIT être à la RACINE du dépôt (Codemagic n'y
+# cherche la config qu'à la racine). L'app Flutter étant dans un sous-dossier,
+# chaque workflow définit `working_directory: App/flutter/debitdouille`.
+# ⚠️ Les chemins `artifacts:` sont résolus depuis la RACINE DU CLONE (pas depuis
+# working_directory) → ils sont préfixés par App/flutter/debitdouille/.
+#
 # Réutilise l'intégration App Store Connect "FURGO_ASC" (même compte Apple,
-# Team ID D284NZAZ6C). L'app n'a aucun secret de build → pas de groupe de
-# variables ni de configs.user.json (contrairement à FURGO).
+# Team ID D284NZAZ6C). L'app n'a aucun secret de build.
 # =============================================================================
 
 workflows:
@@ -13,6 +18,7 @@ workflows:
     name: iOS – Build & TestFlight (Pulvérisateur)
     instance_type: mac_mini_m2
     max_build_duration: 120
+    working_directory: App/flutter/debitdouille
     integrations:
       # Doit correspondre au nom de la clé API dans Codemagic > Integrations.
       app_store_connect: FURGO_ASC
@@ -22,7 +28,7 @@ workflows:
       cocoapods: default
       vars:
         BUNDLE_ID: "fr.furgo.pulverisateur"
-        APP_STORE_APP_ID: "6783067937"   # app "Pulvérisateur" dans App Store Connect
+        APP_STORE_APP_ID: "6783067937"
     scripts:
       - name: Flutter pub get
         script: flutter pub get
@@ -85,7 +91,7 @@ workflows:
             --path 'build/ios/ipa/*.ipa' \
             --max-build-processing-wait 0
     artifacts:
-      - build/ios/ipa/*.ipa
+      - App/flutter/debitdouille/build/ios/ipa/*.ipa
       - /tmp/xcodebuild_logs/*.log
     publishing:
       email:
@@ -103,6 +109,7 @@ workflows:
     name: iOS – Captures App Store (Pulvérisateur)
     instance_type: mac_mini_m2
     max_build_duration: 60
+    working_directory: App/flutter/debitdouille
     environment:
       flutter: 3.35.2
       xcode: latest
@@ -136,7 +143,7 @@ workflows:
       - name: Lister les captures
         script: ls -la screenshots || true
     artifacts:
-      - screenshots/*.png
+      - App/flutter/debitdouille/screenshots/*.png
     publishing:
       email:
         recipients:
